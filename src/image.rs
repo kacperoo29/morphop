@@ -2,8 +2,13 @@ use std::io::Cursor;
 
 use image::io::Reader;
 
-#[derive(Clone, Copy)]
+use crate::kernel::{Kernel, KernelVal};
+
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Pixel(pub u8, pub u8, pub u8, pub u8);
+
+const WHITE: Pixel = Pixel(255, 255, 255, 255);
+const BLACK: Pixel = Pixel(0, 0, 0, 255);
 
 impl Pixel {
     pub fn min(&self, other: Pixel) -> Pixel {
@@ -45,6 +50,7 @@ impl Image {
             width: image.width(),
             height: image.height(),
         }
+        .binarize(128)
     }
 
     pub fn get_bitmap_data(&self) -> &Vec<u8> {
@@ -61,12 +67,6 @@ impl Image {
 
     pub fn get_pixel(&self, x: u32, y: u32) -> Pixel {
         let index = (y as usize * self.width as usize + x as usize) * 4;
-
-        // log if out of bounds
-        if index >= self.data.len() {
-            log::error!("Pixel out of bounds: {}, {}", x, y);
-            log::info!("Image size: {}, {}", self.width, self.height);
-        }
 
         Pixel(
             self.data[index],
@@ -85,82 +85,194 @@ impl Image {
         self.data[index + 3] = pixel.3;
     }
 
-    pub fn dilate(&self, radius: u32) -> Image {
-        self.dilate_or_erode(radius, false)
-    }
-
-    pub fn erode(&self, radius: u32) -> Image {
-        self.dilate_or_erode(radius, true)
-    }
-
-    pub fn open(&self, radius: u32) -> Image {
-        self.erode(radius).dilate(radius)
-    }
-
-    pub fn close(&self, radius: u32) -> Image {
-        self.dilate(radius).erode(radius)
-    }
-
-    pub fn hit_and_miss(&self, radius: u32) -> Image {
+    pub fn binarize(&self, threshold: u8) -> Image {
         let mut result = self.clone();
-        let radius = radius as i32;
 
         for y in 0..self.height {
             for x in 0..self.width {
-                let mut pixel = self.get_pixel(x, y);
+                let pixel = self.get_pixel(x, y);
+                let brightness =
+                    pixel.0 as f32 * 0.2126 + pixel.1 as f32 * 0.7152 + pixel.2 as f32 * 0.0722;
 
-                for dy in -radius as i32..=radius as i32 {
-                    for dx in -radius as i32..=radius as i32 {
-                        if dx == 0 && dy == 0 {
-                            continue;
-                        }
-
-                        let other = self.get_pixel(
-                            (x as i32 + dx).max(0).min(self.width as i32 - 1) as u32,
-                            (y as i32 + dy).max(0).min(self.height as i32 - 1) as u32,
-                        );
-
-                        pixel = pixel.min(other);
-                    }
+                if brightness < threshold.into() {
+                    result.set_pixel(x, y, BLACK);
+                } else {
+                    result.set_pixel(x, y, WHITE);
                 }
-
-                result.set_pixel(x, y, pixel);
             }
         }
 
         result
     }
 
-    fn dilate_or_erode(&self, radius: u32, erode: bool) -> Self {
+    pub fn dilate(&self, kernel: Kernel) -> Image {
+        self.dilate_or_erode(kernel, false)
+    }
+
+    pub fn erode(&self, kernel: Kernel) -> Image {
+        self.dilate_or_erode(kernel, true)
+    }
+
+    pub fn open(&self, kernel: Kernel) -> Image {
+        let mut okernel = Kernel::new();
+        okernel.change_dimension(kernel.get_dimension()).unwrap();
+        self.erode(okernel.clone()).dilate(okernel)
+    }
+
+    pub fn close(&self, kernel: Kernel) -> Image {
+        let mut okernel = Kernel::new();
+        okernel.change_dimension(kernel.get_dimension()).unwrap();
+        self.dilate(okernel.clone()).erode(okernel)
+    }
+
+    pub fn hit_or_miss(&self, kernel: Kernel) -> Image {
+        let mut result = self.clone();
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                result.set_pixel(x, y, self.match_kernel(x, y, &kernel));
+            }
+        }
+
+        result
+    }
+
+    pub fn thinning(&self, kernel: Kernel) -> Self {
+        let mut result = self.clone();
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let matches = self.match_kernel(x, y, &kernel);
+                if matches == WHITE {
+                    result.set_pixel(x, y, BLACK);
+                }
+            }
+        }
+
+        result
+    }
+
+    pub fn thickening(&self, kernel: Kernel) -> Self {
+        let mut result = self.clone();
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let matches = self.match_kernel(x, y, &kernel);
+                if matches == WHITE {
+                    result.set_pixel(x, y, WHITE);
+                }
+            }
+        }
+
+        result
+    }
+
+    fn dilate_or_erode(&self, kernel: Kernel, erode: bool) -> Self {
         let mut new_image = self.clone();
 
         for y in 0..self.height {
             for x in 0..self.width {
-                let mut max = Pixel(0, 0, 0, 0);
-                let mut min = Pixel(255, 255, 255, 255);
-
-                for i in 0..radius * 2 + 1 {
-                    for j in 0..radius * 2 + 1 {
-                        let pixel = self.get_pixel(
-                            (x as i32 - radius as i32 + i as i32)
-                                .max(0)
-                                .min(self.width as i32 - 1) as u32,
-                            (y as i32 - radius as i32 + j as i32)
-                                .max(0)
-                                .min(self.height as i32 - 1) as u32,
-                        );
-
-                        max = max.max(pixel);
-                        min = min.min(pixel);
-                    }
-                }
-
-                let val = if erode { min } else { max };
-
-                new_image.set_pixel(x, y, val);
+                let pixel = self.get_min_or_max(x, y, &kernel, erode);
+                new_image.set_pixel(x, y, pixel);
             }
         }
 
         new_image
+    }
+
+    fn get_min_or_max(&self, row: u32, col: u32, kernel: &Kernel, erode: bool) -> Pixel {
+        let kernel_dim = kernel.get_dimension();
+        let kernel_center = (kernel_dim as i32 - 1) / 2;
+        let center = self.get_pixel(row, col);
+
+        let mut min = WHITE;
+        let mut max = BLACK;
+
+        for y in 0..kernel_dim {
+            for x in 0..kernel_dim {
+                let image_y = (col + y) as i32 - kernel_center;
+                let image_x = (row + x) as i32 - kernel_center;
+                if image_y < 0 || image_y >= self.height as i32 {
+                    min = min.min(center);
+                    max = max.max(center);
+                    continue;
+                }
+
+                if image_x < 0 || image_x >= self.width as i32 {
+                    min = min.min(center);
+                    max = max.max(center);
+                    continue;
+                }
+
+                let pixel = self.get_pixel(image_x as u32, image_y as u32);
+
+                if kernel.get(x, y) != KernelVal::One {
+                    continue;
+                }
+
+                min = min.min(pixel);
+                max = max.max(pixel);
+            }
+        }
+
+        if erode {
+            min
+        } else {
+            max
+        }
+    }
+
+    fn match_kernel(&self, row: u32, col: u32, kernel: &Kernel) -> Pixel {
+        let kernel_dim = kernel.get_dimension();
+        let kernel_center = (kernel_dim as i32 - 1) / 2;
+        let center = self.get_pixel(row, col);
+
+        for y in 0..kernel_dim {
+            for x in 0..kernel_dim {
+                let image_y = (col + y) as i32 - kernel_center;
+                let image_x = (row + x) as i32 - kernel_center;
+                if image_y < 0 || image_y >= self.height as i32 {
+                    if kernel.get(x, y) == KernelVal::Zero {
+                        if center != BLACK {
+                            return BLACK;
+                        }
+                    } else if kernel.get(x, y) == KernelVal::One {
+                        if center != WHITE {
+                            return BLACK;
+                        }
+                    }
+
+                    continue;
+                }
+
+                if image_x < 0 || image_x >= self.width as i32 {
+                    if kernel.get(x, y) == KernelVal::Zero {
+                        if center != BLACK {
+                            return BLACK;
+                        }
+                    } else if kernel.get(x, y) == KernelVal::One {
+                        if center != WHITE {
+                            return BLACK;
+                        }
+                    }
+
+                    continue;
+                }
+
+                let pixel = self.get_pixel(image_x as u32, image_y as u32);
+
+                if kernel.get(x, y) == KernelVal::Zero {
+                    if pixel != BLACK {
+                        return BLACK;
+                    }
+                } else if kernel.get(x, y) == KernelVal::One {
+                    if pixel != WHITE {
+                        return BLACK;
+                    }
+                }
+            }
+        }
+
+        WHITE
     }
 }

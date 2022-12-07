@@ -1,9 +1,11 @@
 mod image;
+mod kernel;
 
 use gloo_events::EventListener;
 use js_sys::Uint8Array;
+use kernel::{Kernel, KernelVal};
 use wasm_bindgen::JsCast;
-use web_sys::{ImageData, HtmlInputElement};
+use web_sys::{HtmlInputElement, ImageData};
 use yew::prelude::*;
 
 enum Msg {
@@ -15,6 +17,10 @@ enum Msg {
     Open,
     Close,
     HitAndMiss,
+    Thinning,
+    Thickening,
+    ToggleKernel(u32, u32, bool),
+    ToggleKernelDontCare(u32, u32),
 }
 
 struct App {
@@ -25,6 +31,8 @@ struct App {
     original_image: Option<image::Image>,
     image: Option<image::Image>,
     radius: u32,
+    kernel: kernel::Kernel,
+    background_kernel: kernel::Kernel,
 }
 
 impl Component for App {
@@ -38,7 +46,15 @@ impl Component for App {
         let is_loading = false;
         let original_image = None;
         let image = None;
-        let radius = 5;
+        let radius = 1;
+        let mut kernel = kernel::Kernel::new();
+        kernel.change_dimension(3).unwrap_or_else(|err| {
+            log::error!("Error: {}", err);
+        });
+        let mut background_kernel = kernel::Kernel::new();
+        background_kernel.change_dimension(3).unwrap_or_else(|err| {
+            log::error!("Error: {}", err);
+        });
 
         Self {
             canvas,
@@ -48,6 +64,8 @@ impl Component for App {
             original_image,
             image,
             radius,
+            kernel,
+            background_kernel,
         }
     }
 
@@ -64,6 +82,48 @@ impl Component for App {
             0
         };
 
+        let toggle_kernel = ctx
+            .link()
+            .callback(move |(x, y, background): (u32, u32, bool)| {
+                Msg::ToggleKernel(x, y, background)
+            });
+
+        let toggle_kernel_dont_care = ctx
+            .link()
+            .callback(move |(x, y): (u32, u32)| Msg::ToggleKernelDontCare(x, y));
+        
+        let kernel = self.kernel.clone();
+        let display_kernel = |kernel: Kernel, background: bool| -> Html {
+            html! {
+                <table>
+                {for (0..kernel.get_dimension()).map(|y| {
+                    html! {
+                        <tr>
+                            {for (0..kernel.get_dimension()).map(|x| {
+                                let is_active = kernel.get(x, y);
+                                let color = if is_active == KernelVal::One {
+                                    "black"
+                                } else if is_active == KernelVal::Zero {
+                                    "white"
+                                } else {
+                                    "red"
+                                };
+                                html! {
+                                    <td
+                                        style={format!("background-color: {}; width: 50px; height: 50px;", color)}
+                                        onclick={toggle_kernel.reform(move |_| (x, y, background))}
+                                        oncontextmenu={toggle_kernel_dont_care.reform(move |_| (x, y))}
+                                        >
+                                    </td>
+                                }
+                            })}
+                        </tr>
+                    }
+                })}
+            </table>
+            }
+        };
+
         html! {
             <div>
                 <div>
@@ -72,21 +132,29 @@ impl Component for App {
                         <span>{"Loading image..."}</span>
                     }
                     if self.original_image.is_some() {
-                        <input type="range" min="0" max="25" 
-                            value={self.radius.to_string()} 
-                            oninput={ctx.link().callback(|event: InputEvent| Msg::RadiusChanged(event))} />
                         <button onclick={ctx.link().callback(|_| Msg::Dilate)}>{"Dilate"}</button>
                         <button onclick={ctx.link().callback(|_| Msg::Erode)}>{"Erode"}</button>
                         <button onclick={ctx.link().callback(|_| Msg::Open)}>{"Open"}</button>
                         <button onclick={ctx.link().callback(|_| Msg::Close)}>{"Close"}</button>
-                        <button onclick={ctx.link().callback(|_| Msg::HitAndMiss)}>{"Hit and Miss"}</button>
+                        <button onclick={ctx.link().callback(|_| Msg::HitAndMiss)}>{"Hit or Miss"}</button>
+                        <button onclick={ctx.link().callback(|_| Msg::Thinning)}>{"Thinning"}</button>
+                        <button onclick={ctx.link().callback(|_| Msg::Thickening)}>{"Thickening"}</button>
                     }
                 </div>
-                <canvas 
-                    ref={self.canvas.clone()} 
-                    width={canvas_width.to_string()} 
+                <canvas
+                    ref={self.canvas.clone()}
+                    width={canvas_width.to_string()}
                     height={canvas_height.to_string()} />
-                
+                <div>
+                    <label>{"Kernel size"}</label>
+                    <input type="number" min="1" max="25" step="2"
+                        value={self.kernel.get_dimension().to_string()}
+                        oninput={ctx.link().callback(|event: InputEvent| Msg::RadiusChanged(event))} />
+                </div>
+                <div>
+                    <label>{"Kernel"}</label>
+                    {display_kernel(kernel, false)}
+                </div>
             </div>
         }
     }
@@ -127,41 +195,82 @@ impl Component for App {
                 let target: HtmlInputElement = event.target().unwrap().dyn_into().unwrap();
                 let value = target.value_as_number() as u32;
                 self.radius = value;
+                self.kernel.change_dimension(value).unwrap_or_else(|err| {
+                    log::error!("Error: {}", err);
+                });
+                self.background_kernel
+                    .change_dimension(value)
+                    .unwrap_or_else(|err| {
+                        log::error!("Error: {}", err);
+                    });
 
                 true
-            },
+            }
             Msg::Dilate => {
                 if let Some(image) = &self.image {
-                    self.image = Some(image.dilate(self.radius));
+                    self.image = Some(image.dilate(self.kernel.clone()));
                 }
 
                 true
             }
             Msg::Erode => {
                 if let Some(image) = &self.image {
-                    self.image = Some(image.erode(self.radius));
+                    self.image = Some(image.erode(self.kernel.clone()));
                 }
 
                 true
             }
             Msg::Open => {
                 if let Some(image) = &self.image {
-                    self.image = Some(image.open(self.radius));
+                    self.image = Some(image.open(self.kernel.clone()));
                 }
 
                 true
-            },
+            }
             Msg::Close => {
                 if let Some(image) = &self.image {
-                    self.image = Some(image.close(self.radius));
+                    self.image = Some(image.close(self.kernel.clone()));
                 }
 
                 true
-            },
+            }
             Msg::HitAndMiss => {
                 if let Some(image) = &self.image {
-                    self.image = Some(image.hit_and_miss(self.radius));
+                    self.image = Some(
+                        image.hit_or_miss(self.kernel.clone()),
+                    );
                 }
+
+                true
+            }
+            Msg::Thinning => {
+                if let Some(image) = &self.image {
+                    self.image =
+                        Some(image.thinning(self.kernel.clone()));
+                }
+
+                true
+            }
+            Msg::Thickening => {
+                if let Some(image) = &self.image {
+                    self.image =
+                        Some(image.thickening(self.kernel.clone()));
+                }
+
+                true
+            }
+            Msg::ToggleKernel(x, y, _) => {
+                let current = self.kernel.get(x, y);
+                if current == KernelVal::One {
+                    self.kernel.set(x, y, KernelVal::Zero);
+                } else {
+                    self.kernel.set(x, y, KernelVal::One);
+                }
+
+                true
+            }
+            Msg::ToggleKernelDontCare(x, y) => {
+                self.kernel.set(x, y, KernelVal::DontCare);
 
                 true
             }
